@@ -1,4 +1,3 @@
-
 import os
 import json
 import time
@@ -7,15 +6,15 @@ from flask import Flask, Response, request, jsonify, make_response
 
 app = Flask(__name__)
 
-# ---- Simple in-memory queue for streaming results to SSE clients ----
-INVOKE_QUEUE = Queue()
+# ==== Simple broker for SSE replies ====
+SSE_QUEUE = Queue()
 
-# ---- Tool definitions (ChatGPT側が解釈しやすい形式) ----
+# ==== Tool definition (MCP JSON-RPC 用) ====
 TOOLS_SPEC = [
     {
         "name": "echo",
         "description": "Echo back the provided text.",
-        # function-calling 準拠のパラメータ定義
+        # JSON Schema (function-calling互換)
         "parameters": {
             "type": "object",
             "properties": {
@@ -23,42 +22,44 @@ TOOLS_SPEC = [
             },
             "required": ["text"],
             "additionalProperties": False
-        },
-        # 実行用のHTTPエンドポイントを明示
-        "endpoint": {
-            "path": "/invoke",
-            "method": "POST"
         }
     }
 ]
 
-# ---- Health check ----
+# ---- Utility: push JSON to SSE as an "rpc" event ----
+def push_rpc(id_, result=None, error=None):
+    payload = {"id": id_}
+    if error is not None:
+        payload["error"] = error
+    else:
+        payload["result"] = result
+    SSE_QUEUE.put(("rpc", payload))
+
+def sse_event(event: str, data: dict) -> str:
+    return f"event: {event}\n" + "data: " + json.dumps(data, ensure_ascii=False) + "\n\n"
+
+# ================= Health =================
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"}), 200
 
-# ---- SSE helpers ----
-def sse_format(event: str, data: dict) -> str:
-    return f"event: {event}\n" + "data: " + json.dumps(data, ensure_ascii=False) + "\n\n"
-
-# ---- Main MCP SSE endpoint (ChatGPTのカスタムMCPが接続) ----
+# ================= MCP SSE (server->client) =================
 @app.route("/mcp", methods=["GET"])
 def mcp_sse():
     def stream():
-        # 接続直後にツール一覧を通知
-        yield sse_format("ready", {"tools": TOOLS_SPEC})
+        # 初回に ready通知（任意だがデバッグしやすい）
+        yield sse_event("ready", {"tools": TOOLS_SPEC})
         last_ping = 0
         while True:
-            # /invoke 側で得た結果をSSEに流す
+            # JSON-RPCレスポンスを流す
             try:
-                result_payload = INVOKE_QUEUE.get_nowait()
-                yield sse_format("result", result_payload)
+                ev, payload = SSE_QUEUE.get_nowait()
+                yield sse_event(ev, payload)
             except Empty:
                 pass
-            # keep-alive ping
             now = time.time()
             if now - last_ping > 15:
-                yield sse_format("ping", {"ts": int(now)})
+                yield sse_event("ping", {"ts": int(now)})
                 last_ping = now
             time.sleep(0.2)
 
@@ -71,53 +72,63 @@ def mcp_sse():
     }
     return Response(stream(), headers=headers)
 
-# プリフライト（保険）
+# (CORS/プリフライト保険)
 @app.route("/mcp", methods=["OPTIONS"])
 def mcp_options():
     resp = make_response(("", 204))
     resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "*"
     return resp
 
-# ---- /sse エイリアス（UIのプレースホルダ互換用）----
+# ================= MCP JSON-RPC (client->server) =================
+@app.route("/mcp", methods=["POST"])
+def mcp_rpc():
+    """
+    ChatGPT Custom MCP からの JSON-RPC を受ける。
+    期待メソッド:
+      - tools/list -> { tools: [...] }
+      - tools/call { name, arguments } -> { content: ... }
+    返信は SSE 側へ event: rpc として流す（idでひも付け）。
+    """
+    req = request.get_json(force=True, silent=True) or {}
+    id_ = req.get("id")  # ChatGPT側が付ける相関ID
+    method = (req.get("method") or "").strip()
+    params = req.get("params") or {}
+
+    try:
+        if method == "tools/list":
+            # ChatGPT が最初にアクション定義をビルドする時に呼ぶ
+            result = {"tools": TOOLS_SPEC}
+            push_rpc(id_, result=result)
+        elif method == "tools/call":
+            name = params.get("name")
+            arguments = params.get("arguments") or {}
+            if name == "echo":
+                text = str(arguments.get("text", ""))
+                # 返却フォーマットは任意。contentに文字列を入れておく
+                result = {"content": f"Hello, {text} from MCP JSON-RPC!"}
+                push_rpc(id_, result=result)
+            else:
+                push_rpc(id_, error={"code": -32601, "message": f"Unknown tool: {name}"})
+        else:
+            push_rpc(id_, error={"code": -32601, "message": f"Unknown method: {method}"})
+    except Exception as e:
+        push_rpc(id_, error={"code": -32603, "message": f"Server error: {e}"})
+
+    # 受領OKだけ即時返す（実体の応答は SSE 側）
+    resp = jsonify({"ok": True})
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return resp, 200
+
+# ===== /sse alias (UIのプレースホルダ互換) =====
 @app.route("/sse", methods=["GET"])
 def mcp_sse_alias():
     return mcp_sse()
 
-# ---- Tool invocation endpoint ----
-@app.route("/invoke", methods=["POST"])
-def invoke():
-    payload = request.get_json(force=True, silent=True) or {}
-    tool = (payload.get("tool") or "").strip()
-    args = payload.get("arguments") or {}
-
-    if tool == "echo":
-        text = str(args.get("text", ""))
-        result = {"tool": tool, "ok": True, "output": f"Hello, {text} from MCP SSE!"}
-    else:
-        result = {"tool": tool, "ok": False, "error": f"Unknown tool: {tool}"}
-
-    # SSE にも配信
-    INVOKE_QUEUE.put(result)
-
-    # CORS付与して返す
-    resp = jsonify(result)
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Headers"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
-    return resp, 200
-
-# プリフライト（保険）
-@app.route("/invoke", methods=["OPTIONS"])
-def invoke_options():
-    resp = make_response(("", 204))
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "*"
-    return resp
-
-# ---- Local run (RenderはProcfile経由でgunicornを使います) ----
+# ===== Local run (RenderはProcfileのgunicornを使用) =====
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port, threaded=True)
