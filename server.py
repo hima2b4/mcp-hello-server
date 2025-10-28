@@ -6,15 +6,14 @@ from flask import Flask, Response, request, jsonify, make_response
 
 app = Flask(__name__)
 
-# ==== Simple broker for SSE replies ====
+# ========= In-memory queue for SSE =========
 SSE_QUEUE = Queue()
 
-# ==== Tool definition (MCP JSON-RPC 用) ====
+# ========= Tools (function-calling 互換スキーマ) =========
 TOOLS_SPEC = [
     {
         "name": "echo",
         "description": "Echo back the provided text.",
-        # JSON Schema (function-calling互換)
         "parameters": {
             "type": "object",
             "properties": {
@@ -22,45 +21,50 @@ TOOLS_SPEC = [
             },
             "required": ["text"],
             "additionalProperties": False
-        }
+        },
     }
 ]
 
-# ---- Utility: push JSON to SSE as an "rpc" event ----
-def push_rpc(id_, result=None, error=None):
-    payload = {"id": id_}
+# ========= Utilities =========
+def sse_event(event: str, data: dict) -> str:
+    return f"event: {event}\n" + "data: " + json.dumps(data, ensure_ascii=False) + "\n\n"
+
+def jsonrpc_result(id_, result):
+    return {"jsonrpc": "2.0", "id": id_, "result": result}
+
+def jsonrpc_error(id_, code, message):
+    return {"jsonrpc": "2.0", "id": id_, "error": {"code": code, "message": message}}
+
+def push_rpc_to_sse(id_, result=None, error=None):
+    payload = {"jsonrpc": "2.0", "id": id_}
     if error is not None:
         payload["error"] = error
     else:
         payload["result"] = result
     SSE_QUEUE.put(("rpc", payload))
 
-def sse_event(event: str, data: dict) -> str:
-    return f"event: {event}\n" + "data: " + json.dumps(data, ensure_ascii=False) + "\n\n"
-
-# ================= Health =================
+# ========= Health =========
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"}), 200
 
-# ================= MCP SSE (server->client) =================
+# ========= MCP: SSE (server -> client) =========
 @app.route("/mcp", methods=["GET"])
 def mcp_sse():
     def stream():
-        # 初回に ready通知（任意だがデバッグしやすい）
+        # 初回に ready 通知（ツール一覧）
         yield sse_event("ready", {"tools": TOOLS_SPEC})
-        last_ping = 0
+        last = 0
         while True:
-            # JSON-RPCレスポンスを流す
             try:
                 ev, payload = SSE_QUEUE.get_nowait()
                 yield sse_event(ev, payload)
             except Empty:
                 pass
             now = time.time()
-            if now - last_ping > 15:
+            if now - last > 15:
                 yield sse_event("ping", {"ts": int(now)})
-                last_ping = now
+                last = now
             time.sleep(0.2)
 
     headers = {
@@ -72,63 +76,66 @@ def mcp_sse():
     }
     return Response(stream(), headers=headers)
 
-# (CORS/プリフライト保険)
-@app.route("/mcp", methods=["OPTIONS"])
-def mcp_options():
+# プレフライト/ヘルス系
+@app.route("/mcp", methods=["OPTIONS", "HEAD"])
+def mcp_meta():
     resp = make_response(("", 204))
     resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, HEAD"
     resp.headers["Access-Control-Allow-Headers"] = "*"
     return resp
 
-# ================= MCP JSON-RPC (client->server) =================
+# ========= MCP: JSON-RPC (client -> server) =========
 @app.route("/mcp", methods=["POST"])
 def mcp_rpc():
-    """
-    ChatGPT Custom MCP からの JSON-RPC を受ける。
-    期待メソッド:
-      - tools/list -> { tools: [...] }
-      - tools/call { name, arguments } -> { content: ... }
-    返信は SSE 側へ event: rpc として流す（idでひも付け）。
-    """
     req = request.get_json(force=True, silent=True) or {}
-    id_ = req.get("id")  # ChatGPT側が付ける相関ID
+    id_ = req.get("id")
     method = (req.get("method") or "").strip()
     params = req.get("params") or {}
 
     try:
         if method == "tools/list":
-            # ChatGPT が最初にアクション定義をビルドする時に呼ぶ
             result = {"tools": TOOLS_SPEC}
-            push_rpc(id_, result=result)
+            # 同期応答
+            body = jsonrpc_result(id_, result)
+            # ついでにSSEにも流す（デバッグ観察用）
+            push_rpc_to_sse(id_, result=result)
+
         elif method == "tools/call":
             name = params.get("name")
             arguments = params.get("arguments") or {}
             if name == "echo":
                 text = str(arguments.get("text", ""))
-                # 返却フォーマットは任意。contentに文字列を入れておく
-                result = {"content": f"Hello, {text} from MCP JSON-RPC!"}
-                push_rpc(id_, result=result)
+                result = {"content": f"Hello, {text} from MCP JSON-RPC sync!"}
+                body = jsonrpc_result(id_, result)
+                push_rpc_to_sse(id_, result=result)
             else:
-                push_rpc(id_, error={"code": -32601, "message": f"Unknown tool: {name}"})
-        else:
-            push_rpc(id_, error={"code": -32601, "message": f"Unknown method: {method}"})
-    except Exception as e:
-        push_rpc(id_, error={"code": -32603, "message": f"Server error: {e}"})
+                err = {"code": -32601, "message": f"Unknown tool: {name}"}
+                body = jsonrpc_error(id_, **err)
+                push_rpc_to_sse(id_, error=err)
 
-    # 受領OKだけ即時返す（実体の応答は SSE 側）
-    resp = jsonify({"ok": True})
+        else:
+            err = {"code": -32601, "message": f"Unknown method: {method}"}
+            body = jsonrpc_error(id_, **err)
+            push_rpc_to_sse(id_, error=err)
+
+    except Exception as e:
+        err = {"code": -32603, "message": f"Server error: {e}"}
+        body = jsonrpc_error(id_, **err)
+        push_rpc_to_sse(id_, error=err)
+
+    resp = jsonify(body)
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Access-Control-Allow-Headers"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, HEAD"
     return resp, 200
 
-# ===== /sse alias (UIのプレースホルダ互換) =====
+# ========= /sse alias =========
 @app.route("/sse", methods=["GET"])
 def mcp_sse_alias():
     return mcp_sse()
 
-# ===== Local run (RenderはProcfileのgunicornを使用) =====
+# ========= Local run =========
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port, threaded=True)
