@@ -72,6 +72,19 @@ def invoke():
     INVOKE_QUEUE.put(result)
     return jsonify(result), 200
 
+@app.route("/sse", methods=["GET"])
+def mcp_sse_alias():
+    return mcp_sse()
+
+@app.route("/mcp", methods=["OPTIONS"])
+def mcp_options():
+    from flask import make_response
+    resp = make_response(("", 204))
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "*"
+    return resp
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port, threaded=True)
